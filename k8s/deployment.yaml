@@ -1,0 +1,69 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Deployment de Kubernetes para Springuma
+# Un Deployment garantiza que siempre haya un número definido de réplicas
+# del contenedor corriendo en el clúster. Si un pod cae, Kubernetes lo
+# reinicia automáticamente.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  # Nombre del Deployment dentro del clúster. Se referencia en el workflow
+  # con: kubectl rollout status deployment/springuma
+  name: springuma
+  labels:
+    app: springuma
+spec:
+  # Número de réplicas (pods) que se ejecutarán simultáneamente.
+  # Con 1 réplica es suficiente para desarrollo/pruebas.
+  replicas: 1
+
+  # Selector que vincula este Deployment con los pods que gestiona.
+  # Debe coincidir con los labels definidos en template.metadata.labels.
+  selector:
+    matchLabels:
+      app: springuma
+
+  template:
+    metadata:
+      labels:
+        app: springuma
+    spec:
+      containers:
+        - name: springuma
+          # Imagen publicada en Docker Hub por el workflow de CI/CD.
+          # El workflow actualiza este tag automáticamente con kubectl set image.
+          image: juanchu05/springuma:latest
+
+          # Puerto que expone el contenedor internamente en el clúster.
+          # Debe coincidir con el EXPOSE del Dockerfile y el server.port de Spring.
+          ports:
+            - containerPort: 8080
+
+          # ── Sondas de salud ──────────────────────────────────────────────
+          # livenessProbe: Kubernetes reinicia el pod si la app deja de responder.
+          # readinessProbe: Kubernetes no envía tráfico al pod hasta que esté listo.
+          # El endpoint /actuator/health lo proporciona Spring Boot Actuator.
+          livenessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+
+          readinessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 5
+
+          # ── Recursos ─────────────────────────────────────────────────────
+          # Limitar los recursos evita que un pod consuma toda la CPU/memoria
+          # del nodo y afecte a otros servicios del clúster.
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"

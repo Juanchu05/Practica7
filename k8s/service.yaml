@@ -1,0 +1,32 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Service de Kubernetes para Springuma
+# Un Service expone los pods del Deployment como un endpoint de red estable.
+# Sin Service, los pods serían accesibles solo por su IP interna (que cambia
+# cada vez que el pod se reinicia).
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: springuma-service
+spec:
+  # NodePort expone el servicio en un puerto estático de cada nodo del clúster,
+  # permitiendo acceder a la aplicación desde fuera del clúster mediante
+  # http://<IP-del-nodo>:<nodePort>
+  # Es la opción adecuada para clústeres locales (Minikube, kind, k3s).
+  type: NodePort
+
+  # Selector que vincula el Service con los pods del Deployment.
+  # Debe coincidir con los labels del Deployment.
+  selector:
+    app: springuma
+
+  ports:
+    - protocol: TCP
+      # Puerto interno del contenedor (el que usa Spring Boot)
+      port: 8080
+      # Puerto al que se redirige dentro del pod (igual que containerPort)
+      targetPort: 8080
+      # Puerto externo del nodo para acceder desde fuera del clúster.
+      # Rango válido de NodePort: 30000-32767.
+      # Acceso: http://localhost:30090 (o la IP del nodo si es remoto)
+      nodePort: 30090
