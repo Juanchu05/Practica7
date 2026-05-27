@@ -1,0 +1,133 @@
+name: CD - Build, Push y Despliegue en Kubernetes
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DISPARADORES DEL WORKFLOW
+# Se ejecuta únicamente en push a la rama main/master, ya que este workflow
+# realiza un despliegue real en producción. No se dispara en PRs para evitar
+# despliegues accidentales de código no revisado.
+# ─────────────────────────────────────────────────────────────────────────────
+on:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build-push-deploy:
+    # El workflow usa un runner auto-hospedado (self-hosted) instalado como
+    # servicio en la misma máquina donde corre el clúster Kubernetes local.
+    # Esto permite que el runner tenga acceso directo a kubectl y al clúster
+    # sin necesidad de exponer el clúster a internet.
+    # Si quieres usar el runner de GitHub (ubuntu-latest), necesitarías un
+    # proxy o VPN para acceder al clúster local.
+    runs-on: self-hosted
+
+    # ── Permisos ────────────────────────────────────────────────────────────
+    # contents: read es suficiente aquí porque solo leemos el código.
+    # No necesitamos write porque no modificamos el repositorio en este workflow.
+    permissions:
+      contents: read
+
+    steps:
+
+      # ── Paso 1: Descargar el código ────────────────────────────────────────
+      # Clona el repositorio en el runner para tener acceso al código fuente
+      # y al Dockerfile necesario para construir la imagen.
+      - name: Checkout repositorio
+        uses: actions/checkout@v4
+
+      # ── Paso 2: Instalar Java ──────────────────────────────────────────────
+      # Configura JDK 17 en el runner para poder compilar y empaquetar
+      # la aplicación Spring Boot con Maven antes de construir la imagen Docker.
+      # La caché de Maven evita descargar todas las dependencias en cada ejecución.
+      - name: Configurar JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: maven
+
+      # ── Paso 3: Permisos al wrapper de Maven ──────────────────────────────
+      # En Linux, los ficheros clonados desde Git pueden perder el bit de
+      # ejecución. Es necesario darlo antes de llamar a ./mvnw.
+      - name: Dar permisos a mvnw
+        run: chmod +x ./mvnw
+
+      # ── Paso 4: Compilar y empaquetar la aplicación ────────────────────────
+      # La fase 'package' de Maven compila el código y genera el JAR ejecutable
+      # en target/*.jar, que será copiado dentro de la imagen Docker.
+      # -DskipTests evita ejecutar los tests en este workflow de despliegue,
+      # ya que los tests se ejecutan en el workflow de CI (ci.yml) por separado.
+      - name: Compilar y empaquetar con Maven
+        run: ./mvnw package --no-transfer-progress -DskipTests
+
+      # ── Paso 5: Autenticarse en Docker Hub ────────────────────────────────
+      # Usa la action oficial de Docker para hacer login en Docker Hub.
+      # Las credenciales se almacenan como secrets en el repositorio de GitHub
+      # (Settings → Secrets and variables → Actions) y nunca aparecen en los logs.
+      # - DOCKERHUB_USERNAME: tu nombre de usuario de Docker Hub
+      # - DOCKERHUB_TOKEN:    un Access Token generado en hub.docker.com
+      #   (recomendado en lugar de la contraseña por seguridad)
+      - name: Login en Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # ── Paso 6: Extraer metadatos para el tag de la imagen ─────────────────
+      # docker/metadata-action genera automáticamente los tags e información
+      # de la imagen a partir del contexto del commit:
+      #   - Tag con el SHA corto del commit (ej: sha-a1b2c3d) → trazabilidad exacta
+      #   - Tag 'latest' → siempre apunta a la última versión desplegada
+      # El resultado se pasa al paso de build mediante outputs.tags y outputs.labels.
+      - name: Extraer metadatos Docker (tags y labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/springuma
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest
+
+      # ── Paso 7: Construir y publicar la imagen Docker ──────────────────────
+      # docker/build-push-action construye la imagen usando el Dockerfile del
+      # repositorio y la publica directamente en Docker Hub.
+      # - context: . → usa el directorio raíz como contexto de build (donde
+      #   está el Dockerfile y el JAR generado en target/)
+      # - push: true → sube la imagen a Docker Hub tras construirla
+      # - tags/labels → valores generados en el paso anterior (meta)
+      - name: Construir y publicar imagen Docker en Docker Hub
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      # ── Paso 8: Desplegar en Kubernetes ───────────────────────────────────
+      # Aplica los manifiestos de Kubernetes (Deployment + Service) que deben
+      # estar en la carpeta k8s/ del repositorio.
+      # kubectl aplica los cambios de forma declarativa: si el Deployment ya
+      # existe, lo actualiza; si no, lo crea.
+      #
+      # A continuación, rollout status espera a que el Deployment termine de
+      # actualizarse antes de continuar (o falla si tarda más de 2 minutos).
+      # Esto garantiza que el workflow solo marca éxito cuando la nueva versión
+      # está realmente corriendo en el clúster.
+      #
+      # REQUISITO: el runner self-hosted debe tener kubectl instalado y
+      # configurado con acceso al clúster (~/.kube/config apuntando al clúster local).
+      - name: Desplegar en clúster Kubernetes local
+        run: |
+          # Aplicar los manifiestos del Deployment y el Service
+          kubectl apply -f k8s/deployment.yaml
+          kubectl apply -f k8s/service.yaml
+
+          # Forzar la actualización de la imagen en el Deployment con el tag del commit
+          # Esto es necesario si el Deployment ya usaba 'latest', ya que kubectl apply
+          # no re-descarga la imagen si el tag no cambia.
+          kubectl set image deployment/springuma \
+            springuma=${{ secrets.DOCKERHUB_USERNAME }}/springuma:sha-$(echo ${{ github.sha }} | cut -c1-7)
+
+          # Esperar a que el rollout se complete (timeout: 2 minutos)
+          kubectl rollout status deployment/springuma --timeout=120s
