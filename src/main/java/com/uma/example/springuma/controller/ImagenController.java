@@ -68,7 +68,7 @@ public class ImagenController {
             imagenService.removeImagenByID(id);
             return ResponseEntity.noContent().build();
         } catch (Exception e) {
-            e.printStackTrace()
+            e.printStackTrace();
             return ResponseEntity.internalServerError().body("Error al eliminar la imagen");
         }
     }
